@@ -52,9 +52,9 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/BrianWong05/TokenLedger/releases/latest/download/latest.json"
+        "https://github.com/raymao96/TokenLedger/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM0MzA4ODA2NDYxMjBEQkMKUldTOERSSkdCb2d3TkZWUDIya1A5ZlVyazZpVXBUd0IwZGpYc2ZmSkNSNFA4dllXQ0E2dTlhK3EK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc4NzQ3OTgxQURCMzUyRQpSV1F1TmRzYW1FZUhCK2h3RHlncHZ6M2Z2YUllS1hWVHJmVFBTMHFrSHJsZzBHd2dpaU1tMkxyUQo="
     }
   },
   "bundle": {

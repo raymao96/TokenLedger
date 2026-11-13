@@ -293,6 +293,7 @@ export function windowLabel(
 ):
   | { kind: 'session' | 'weekly' | 'weeklyCredits' | 'monthlyCredits'; pool?: string; model?: undefined }
   | { kind: 'model'; model: string; pool?: string }
+  | { kind: 'quota'; name: string; pool?: string }
   | { kind: 'other'; minutes: string; pool?: string } {
   const split = key.indexOf(':');
   if (split > 0) {
@@ -310,6 +311,7 @@ export function windowLabel(
   // being guessed into a lane it may not belong to.
   const minutes = /^w(\d+)$/.exec(key);
   if (minutes) return { kind: 'other', minutes: minutes[1] };
+  if (source === 'antigravity') return { kind: 'quota', name: capitalize(key) };
   return { kind: 'model', model: capitalize(key) };
 }
 

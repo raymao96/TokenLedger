@@ -12,7 +12,7 @@ use crate::db::{insert_events_superseding, source_session_ids, upsert_source_ses
 use crate::types::{SourceScanResult, SourceSessionMeta, UsageEvent};
 
 const SOURCE: &str = "opencode";
-const PARSER_VERSION: i64 = 2;
+const PARSER_VERSION: i64 = 3;
 
 /// OpenCode's Antigravity plugin exposes Google Antigravity's models under
 /// `antigravity-…` prefixed names — internal routing aliases that match no
@@ -278,16 +278,21 @@ fn add_unique(paths: &mut Vec<PathBuf>, path: &Path) {
 
 fn scan_database(path: &Path) -> Result<OpencodeScan, String> {
     let conn = super::open_sqlite_artifact(SOURCE, path)?;
-    for (table, columns) in SUPPORTED_SCHEMA {
-        super::require_columns(SOURCE, &conn, table, columns)?;
+    let old_schema = SUPPORTED_SCHEMA.iter().all(|(table, columns)|
+        super::require_columns(SOURCE, &conn, table, columns).is_ok());
+    if !old_schema {
+        for (table, columns) in V2_SCHEMA {
+            super::require_columns(SOURCE, &conn, table, columns)?;
+        }
     }
 
     let mut scan = OpencodeScan::default();
     let mut sessions = conn
-        .prepare(
-            "SELECT id, directory, time_created, time_updated
-             FROM session ORDER BY id",
-        )
+        .prepare(if old_schema {
+            "SELECT id, directory, time_created, time_updated FROM session ORDER BY id"
+        } else {
+            "SELECT id, directory, time_created, time_updated FROM session_v2 ORDER BY id"
+        })
         .map_err(|error| format!("{SOURCE}: session query failed: {error}"))?;
     let rows = sessions
         .query_map([], |row| {
@@ -322,10 +327,13 @@ fn scan_database(path: &Path) -> Result<OpencodeScan, String> {
             continue;
         };
         let mut messages = conn
-            .prepare(
-                "SELECT id, data, time_created FROM message
-                 WHERE session_id = ?1 ORDER BY time_created, id",
-            )
+            .prepare(if old_schema {
+                "SELECT id, data, time_created, NULL FROM message
+                 WHERE session_id = ?1 ORDER BY time_created, id"
+            } else {
+                "SELECT id, data, time_created, type FROM session_message
+                 WHERE session_id = ?1 ORDER BY time_created, id"
+            })
             .map_err(|error| format!("{SOURCE}: message query failed: {error}"))?;
         let message_rows = messages
             .query_map([&session_id], |row| {
@@ -333,15 +341,21 @@ fn scan_database(path: &Path) -> Result<OpencodeScan, String> {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })
             .map_err(|error| format!("{SOURCE}: message read failed: {error}"))?;
         let mut booked: Vec<String> = Vec::new();
         for message in message_rows {
-            let (message_id, data, message_time) =
+            let (message_id, data, message_time, message_type) =
                 message.map_err(|error| format!("{SOURCE}: message row failed: {error}"))?;
             match serde_json::from_str::<Value>(&data) {
-                Ok(value) => match parse_message(&value) {
+                Ok(mut value) => match {
+                    if let (Some(role), Some(object)) = (message_type, value.as_object_mut()) {
+                        object.insert("role".to_string(), Value::String(role));
+                    }
+                    parse_message(&value)
+                } {
                     ParsedMessage::NotUsage => {}
                     ParsedMessage::Zero => scan.lines_skipped += 1,
                     ParsedMessage::Usage(snapshot) => {
@@ -378,6 +392,11 @@ fn scan_database(path: &Path) -> Result<OpencodeScan, String> {
 const SUPPORTED_SCHEMA: &[(&str, &[&str])] = &[
     ("session", &["id", "directory", "time_created", "time_updated"]),
     ("message", &["id", "session_id", "time_created", "data"]),
+];
+
+const V2_SCHEMA: &[(&str, &[&str])] = &[
+    ("session_v2", &["id", "directory", "time_created", "time_updated"]),
+    ("session_message", &["id", "session_id", "time_created", "type", "data"]),
 ];
 
 fn discover_legacy_sessions(root: &Path) -> Vec<PathBuf> {
@@ -664,6 +683,7 @@ fn parse_message(value: &Value) -> ParsedMessage {
     let model = value
         .get("modelID")
         .and_then(Value::as_str)
+        .or_else(|| value.get("model").and_then(|model| model.get("id")).and_then(Value::as_str))
         .filter(|model| !model.is_empty())
         .map(str::to_string)
         // Antigravity Plugin logs `antigravity-…` routing aliases — translate
@@ -744,6 +764,28 @@ mod tests {
     use tempfile::tempdir;
 
     type EventRow = (String, i64, Option<String>, i64, i64, i64, i64, String);
+
+    #[test]
+    fn scans_v2_messages_using_type_and_nested_model() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE session_v2 (id TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER);
+            CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, time_created INTEGER, data TEXT);
+            INSERT INTO session_v2 VALUES ('s1', '/tmp/project', 1700000000000, 1700000001000);").unwrap();
+        db.execute("INSERT INTO session_message VALUES (?1, 's1', ?2, 1700000002000, ?3)",
+            params!["m1", "assistant", r#"{"model":{"id":"test-model"},"tokens":{"input":30,"output":8,"reasoning":3,"cache":{"read":10,"write":2}}}"#]).unwrap();
+        db.execute("INSERT INTO session_message VALUES (?1, 's1', ?2, 1700000003000, ?3)",
+            params!["m2", "user", r#"{"tokens":{"input":999}}"#]).unwrap();
+        drop(db);
+        let scan = scan_database(&path).unwrap();
+        assert_eq!(scan.events.len(), 1);
+        let event = &scan.events[0];
+        assert_eq!(event.model.as_deref(), Some("test-model"));
+        assert_eq!((event.input_tokens, event.output_tokens, event.cache_read_tokens, event.cache_write_5m_tokens), (30, 8, 10, 2));
+        assert_eq!(event.timestamp, 1700000002);
+        assert_eq!(event.dedup_key, "opencode:session:s1:message:m1");
+    }
 
     #[test]
     fn translate_antigravity_resolves_known_aliases_and_their_variants() {

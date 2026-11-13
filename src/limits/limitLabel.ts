@@ -18,20 +18,28 @@ export type LimitT = (key: keyof (typeof limitStrings)['en']) => string;
 
 export type WindowLabelParts = ReturnType<typeof windowLabel>;
 
+export function poolPrefix(t: LimitT, pool: string | undefined): string {
+  if (!pool) return '';
+  const names: Record<string, string> = {
+    gemini: t('limits.pool.gemini'),
+    '3p': t('limits.pool.other'),
+    'gemini-argon-wtu': 'Gemini 4 Argon',
+    'gemini-carbon-wtu': 'Gemini 4 Carbon',
+  };
+  return `${Object.prototype.hasOwnProperty.call(names, pool) ? names[pool] : pool} · `;
+}
+
 /**
  * Pools ride the label the way the Limits page prefixes them; a per-model window
  * carries "· Weekly" as a `sub` so long model names stay scannable, and a
  * surface with one line of room prints `text` alone.
  */
 export function windowText(t: LimitT, label: WindowLabelParts): { text: string; sub?: string } {
-  const pools: Record<string, string> = {
-    gemini: t('limits.pool.gemini'),
-    '3p': t('limits.pool.other'),
-  };
-  const pool = label.pool ? `${pools[label.pool] ?? label.pool} · ` : '';
+  const pool = poolPrefix(t, label.pool);
   if (label.kind === 'model') {
     return { text: `${pool}${label.model}`, sub: `· ${t('limits.win.weeklySub')}` };
   }
+  if (label.kind === 'quota') return { text: pool + label.name };
   if (label.kind === 'other') {
     return { text: pool + fill(t('limits.win.other'), { n: label.minutes }) };
   }

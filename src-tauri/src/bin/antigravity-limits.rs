@@ -51,35 +51,14 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use tokenledger_lib::limits_artifact::{
-    self, LimitsExport, WindowExport, NOT_SIGNED_IN,
+    self, LimitState, LimitStateWindow, LimitsExport, WindowExport, NOT_SIGNED_IN, STATE_SCHEMA,
 };
 
-/// Both release-channel frontends, `daily-` first — because that is the one
-/// Antigravity's own client actually calls. Its logs on this machine show
-/// ~13,000 requests to `daily-` against four to production, which overturns the
-/// research's reading (inferred from a 1:5 ratio of string occurrences in the
-/// binary, and wrong: the plain host is the rarity).
-///
-/// Both are tried, and **a refusal is never a reason to stop trying** — that is
-/// openusage's documented bug, where a canary 401 short-circuits the whole list
-/// and reports a signed-out card for a perfectly good session. Here the first
-/// success wins and the last failure is what gets reported.
-const CLOUD_CODE_HOSTS: [&str; 2] = [
-    "https://daily-cloudcode-pa.googleapis.com/v1internal",
-    "https://cloudcode-pa.googleapis.com/v1internal",
-];
+/// The desktop app's Cloud Code endpoint. The other endpoint can return a
+/// different Gemini balance for the same sign-in, so it cannot stand in for it.
+const CLOUD_CODE_HOST: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-/// The User-Agent cloudcode-pa's Gemini Code Assist surface gates client
-/// eligibility on. An unrecognised agent is answered `UNSUPPORTED_CLIENT` and
-/// refused every data call — verified live, and the one difference between this
-/// Companion and openusage, which works. These are the vendor's own client
-/// names (`antigravity` the app, `agy` the CLI), and each call uses the one
-/// openusage uses for it. This is the posture ADR-0019 already accepts for this
-/// route: we present Antigravity's own client id and token to Google, so naming
-/// its client in the agent is consistent, not a new decision. An honest
-/// TokenLedger agent was tried first and is exactly what the surface refuses.
-const UA_APP: &str = "antigravity";
-const UA_CLI: &str = "agy";
+const VERIFIED_HUB_VERSION: &str = "2.35.1";
 
 /// Antigravity's own installed-app client, verified verbatim in its
 /// `language_server` binary. Presenting it means presenting ourselves to Google
@@ -88,6 +67,7 @@ const UA_CLI: &str = "agy";
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 /// How Google spells the other half of an installed-app pair.
 const SECRET_PREFIX: &[u8] = b"GOCSPX-";
+const SECRET_SUFFIX_LEN: usize = 28;
 
 /// Enough of the id to anchor the secret scan on — the account part, taken off
 /// `CLIENT_ID` rather than written out again, since a second copy could drift
@@ -116,22 +96,6 @@ const ENVELOPE_PREFIX: &str = "go-keyring-base64:";
 /// is a failure and must never be reported as an absence.
 const EXIT_ITEM_NOT_FOUND: i32 = 44;
 
-/// Bucket id → the Reading's key and duration. Matched **exactly**: the pool is
-/// never inferred from `display_name` or the `window` string, both of which are
-/// server-side vocabulary that can change without a client update. A future
-/// `gemini-image-5h` must not silently join the Gemini pool.
-///
-/// The key carries the pool because Antigravity is the first Source where the
-/// pool is a genuine second axis rather than a slot: two pools share both
-/// durations, so `w300` alone addresses two different pools with two different
-/// fill levels, and one would displace the other in a Reading's own identity.
-const BUCKETS: [(&str, &str, i64); 4] = [
-    ("gemini-5h", "gemini:w300", 300),
-    ("gemini-weekly", "gemini:w10080", 10080),
-    ("3p-5h", "3p:w300", 300),
-    ("3p-weekly", "3p:w10080", 10080),
-];
-
 fn main() {
     match run() {
         // stdout echoes the Artifact for a hand run and for inspection. It is not
@@ -148,19 +112,11 @@ fn run() -> Result<String, String> {
     let credential = credential()?;
     let fetched_at = now();
     let access_token = access_token(&credential, fetched_at)?;
+    let user_agent = hub_user_agent(desktop_version().as_deref());
 
     // One call, two needs: the project the summary request names, and the plan
     // label.
-    let assist = post(&access_token, "loadCodeAssist", json!({}), UA_CLI)?;
-
-    // `--shape` is the hand-run diagnostic for when a payload moves — the app can
-    // never pass it (its sidecar allowlist carries no args). It dumps the calls
-    // that decide whether this account has a reachable Limit surface at all
-    // (#139), each answer's shape plus the vendor's own explanation prose in
-    // full, so the next step is read off facts rather than guessed.
-    if std::env::args().skip(1).any(|a| a == "--shape") {
-        return Ok(diagnose(&access_token, &assist));
-    }
+    let assist = post(&access_token, "loadCodeAssist", &json!({}), &user_agent)?;
 
     // The descriptor marks `project` REQUIRED, so it is passed whenever the
     // vendor named one. When it does not — an individual-tier account may have
@@ -178,14 +134,19 @@ fn run() -> Result<String, String> {
         Some(project) => json!({ "project": project }),
         None => json!({}),
     };
-    let body = post(&access_token, "retrieveUserQuotaSummary", request, UA_APP)?;
+    let summary = post(&access_token, "retrieveUserQuotaSummary", &request, &user_agent);
 
+    if std::env::args().skip(1).any(|a| a == "--shape") {
+        return Ok(diagnose(&access_token, &user_agent, &assist, &summary));
+    }
+
+    let (windows, undated) = windows(&summary?)?;
     let export = LimitsExport {
         schema: limits_artifact::SCHEMA,
         source: "antigravity".to_string(),
         fetched_at,
         plan: plan(&assist),
-        windows: windows(&body),
+        windows,
         // Antigravity is not in the estimate map: nothing has established
         // what each of its pools meters, so it claims nothing.
         ..Default::default()
@@ -195,8 +156,21 @@ fn run() -> Result<String, String> {
     // the app at all, so exiting 0 here would report success having delivered
     // nothing, and the card would show an absence rather than the cause.
     if let Some(dir) = std::env::var_os("TOKENLEDGER_LIMITS_DIR") {
-        limits_artifact::write(&PathBuf::from(dir), &export)
+        let dir = PathBuf::from(dir);
+        limits_artifact::write(&dir, &export)
             .map_err(|err| format!("could not write the export: {err}"))?;
+        // Replace the previous snapshot even when every bucket now has a reset.
+        limits_artifact::write_state(
+            &dir,
+            &LimitState {
+                schema: STATE_SCHEMA,
+                source: export.source.clone(),
+                via: "live".to_string(),
+                observed_at: fetched_at,
+                windows: undated,
+            },
+        )
+        .map_err(|err| format!("could not write the current limits: {err}"))?;
     }
     serde_json::to_string(&export).map_err(|e| e.to_string())
 }
@@ -298,11 +272,20 @@ fn parse_envelope(raw: &str) -> Result<Credential, String> {
         .map_err(|_| unreadable())?;
     let v: Value = serde_json::from_slice(&decoded).map_err(|_| unreadable())?;
 
-    let token = v.get("token").ok_or_else(unreadable)?;
-    let string = |key: &str| token.get(key).and_then(|t| t.as_str()).unwrap_or_default();
+    let token = v
+        .get("token")
+        .and_then(Value::as_object)
+        .ok_or_else(unreadable)?;
+    let string = |key: &str| {
+        token
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+    };
     let access_token = string("access_token");
     let refresh_token = string("refresh_token");
-    if access_token.trim().is_empty() && refresh_token.trim().is_empty() {
+    if access_token.is_empty() && refresh_token.is_empty() {
         return Err(format!(
             "{NOT_SIGNED_IN}: the stored sign-in carries no token"
         ));
@@ -367,15 +350,13 @@ fn exchange(refresh_token: &str) -> Result<String, String> {
             .map_err(|e| e.to_string())
             .and_then(|body| serde_json::from_str(&body).map_err(|e| e.to_string()))
             .map_err(|e| format!("the sign-in service's answer could not be read: {e}"))?,
-        // A revoked or expired grant is the signed-out card, pointing at
-        // Antigravity — never an attempt to repair a session we do not own.
-        Err(ureq::Error::Status(400 | 401 | 403, _)) => {
-            return Err(format!(
-                "{NOT_SIGNED_IN}: Google would not renew the saved Antigravity sign-in — open Antigravity once to sign in again"
-            ))
-        }
-        Err(ureq::Error::Status(code, _)) => {
-            return Err(format!("the sign-in service answered {code}"))
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response
+                .into_string()
+                .ok()
+                .and_then(|body| serde_json::from_str(&body).ok())
+                .unwrap_or(Value::Null);
+            return Err(refresh_failure(code, &body));
         }
         Err(err) => return Err(format!("could not reach the sign-in service: {err}")),
     };
@@ -387,6 +368,18 @@ fn exchange(refresh_token: &str) -> Result<String, String> {
         .filter(|t| !t.trim().is_empty())
         .map(str::to_string)
         .ok_or_else(|| "the sign-in service returned no access pass".to_string())
+}
+
+fn refresh_failure(code: u16, body: &Value) -> String {
+    match body.get("error").and_then(Value::as_str) {
+        Some("invalid_grant") if code == 400 => format!(
+            "{NOT_SIGNED_IN}: Google would not renew the saved Antigravity sign-in — open Antigravity once to sign in again"
+        ),
+        Some(reason @ ("invalid_client" | "unauthorized_client" | "deleted_client")) => {
+            format!("Google refused the Antigravity OAuth client ({code}, {reason})")
+        }
+        _ => format!("the sign-in service answered {code}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -417,22 +410,45 @@ fn client_secret() -> Result<String, String> {
 /// Where Antigravity keeps the client. Both halves of the pair ship inside it —
 /// which is where they came from in the first place.
 fn language_server() -> Option<PathBuf> {
-    const BUNDLE: &str = "Antigravity.app/Contents/Resources/bin/language_server";
-    let mut candidates = vec![PathBuf::from("/Applications").join(BUNDLE)];
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join("Applications").join(BUNDLE));
-    }
-    candidates.into_iter().find(|path| path.is_file())
+    desktop_bundles()
+        .map(|bundle| bundle.join("Contents/Resources/bin/language_server"))
+        .find(|path| path.is_file())
 }
 
-/// The secret belonging to *our* client id: the nearest `GOCSPX-` string to the
-/// id itself. A binary carrying one pair has exactly one candidate and the
-/// distance never matters; one carrying several — a future build bundling
-/// another Google client — would otherwise be a coin toss, and Google's own
-/// codegen emits a pair's halves adjacent.
-///
-/// ponytail: proximity, not proof. If a build ever interleaves two clients'
-/// constants, anchor on the surrounding struct instead.
+fn desktop_bundles() -> impl Iterator<Item = PathBuf> {
+    std::iter::once(PathBuf::from("/Applications/Antigravity.app")).chain(
+        dirs::home_dir().map(|home| home.join("Applications/Antigravity.app")),
+    )
+}
+
+fn desktop_version() -> Option<String> {
+    let plist = desktop_bundles()
+        .map(|bundle| bundle.join("Contents/Info.plist"))
+        .find(|path| path.is_file())?;
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleShortVersionString", "raw"])
+        .arg(plist)
+        .output()
+        .ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Google sends only third-party buckets when the desktop hub version is absent.
+fn hub_user_agent(version: Option<&str>) -> String {
+    let version = version.map(str::trim).filter(|version| {
+        version.len() <= 32
+            && version.split('.').count() == 3
+            && version.split('.').all(|part| {
+                !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    });
+    format!("antigravity/hub/{}", version.unwrap_or(VERIFIED_HUB_VERSION))
+}
+
+/// The 2.35 desktop OAuth function references the client ID and the secret
+/// immediately after `:generateContent` in its Go string table. A nearby MCP
+/// client has its own secret, so proximity alone picks the wrong pair there.
+/// Keep the proximity lookup for older builds with a different string layout.
 fn secret_in(image: &[u8]) -> Option<String> {
     let anchor = find(image, id_anchor())?;
     let mut nearest: Option<(usize, String)> = None;
@@ -440,6 +456,12 @@ fn secret_in(image: &[u8]) -> Option<String> {
     while let Some(found) = find(&image[at..], SECRET_PREFIX) {
         let start = at + found;
         if let Some(secret) = secret_at(image, start) {
+            let tail = start + secret.len();
+            if image[..start].ends_with(b":generateContent")
+                && find(&image[tail..image.len().min(tail + 45)], b"sandbox.googleapis.com").is_some()
+            {
+                return Some(secret);
+            }
             let closer = nearest
                 .as_ref()
                 .is_none_or(|(best, _)| start.abs_diff(anchor) < best.abs_diff(anchor));
@@ -452,16 +474,16 @@ fn secret_in(image: &[u8]) -> Option<String> {
     nearest.map(|(_, secret)| secret)
 }
 
-/// The candidate starting at `at`, run out to the first byte that cannot belong
-/// to one. A bare prefix with nothing after it is a string table's leftover, not
-/// a secret.
+/// Go packs adjacent strings together without a terminator. Read only the
+/// 28-character OAuth client secret suffix, even if the next string starts
+/// with characters from the same alphabet.
 fn secret_at(image: &[u8], at: usize) -> Option<String> {
-    let end = image[at..]
+    let candidate = image.get(at..at + SECRET_PREFIX.len() + SECRET_SUFFIX_LEN)?;
+    let suffix = candidate.strip_prefix(SECRET_PREFIX)?;
+    suffix
         .iter()
-        .position(|b| !(b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_'))
-        .map_or(image.len(), |n| at + n);
-    let candidate = std::str::from_utf8(image.get(at..end)?).ok()?;
-    (candidate.len() >= SECRET_PREFIX.len() + 16).then(|| candidate.to_string())
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+        .then(|| String::from_utf8_lossy(candidate).into_owned())
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -472,29 +494,16 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // The fetch
 // ---------------------------------------------------------------------------
 
-fn post(access_token: &str, method: &str, body: Value, user_agent: &str) -> Result<Value, String> {
-    let mut last = String::new();
-    for host in CLOUD_CODE_HOSTS {
-        match post_to(host, access_token, method, &body, user_agent) {
-            Ok(answer) => return Ok(answer),
-            Err(err) => last = err,
-        }
-    }
-    Err(last)
-}
-
-fn post_to(
-    host: &str,
+fn post(
     access_token: &str,
     method: &str,
     body: &Value,
     user_agent: &str,
 ) -> Result<Value, String> {
-    let response = ureq::post(&format!("{host}:{method}"))
+    let response = ureq::post(&format!("{CLOUD_CODE_HOST}:{method}"))
         .set("Authorization", &format!("Bearer {access_token}"))
         .set("Content-Type", "application/json")
         .set("Accept", "application/json")
-        // The client the surface gates on (see UA_APP/UA_CLI).
         .set("User-Agent", user_agent)
         .timeout(Duration::from_secs(15))
         .send_string(&body.to_string());
@@ -528,18 +537,25 @@ fn post_to(
 /// explanation string in full — those are the vendor's public error and tier
 /// prose (`reasonMessage`, `message`, `description`), never a credential, and
 /// they are the redacted `<str 180>` that `shape` alone hides.
-fn diagnose(access_token: &str, assist: &Value) -> String {
+fn diagnose(
+    access_token: &str,
+    user_agent: &str,
+    assist: &Value,
+    summary: &Result<Value, String>,
+) -> String {
     fn section(title: &str, body: &Value) -> String {
         let prose: String = prose(body).iter().map(|line| format!("  \"{line}\"\n")).collect();
         format!("--- {title} ---\n{}{prose}", limits_artifact::shape(body))
     }
     let mut out = section("loadCodeAssist", assist);
-    for method in ["fetchAvailableModels", "retrieveUserQuotaSummary"] {
-        out.push_str(&match post(access_token, method, json!({}), UA_APP) {
-            Ok(body) => section(method, &body),
-            Err(err) => format!("--- {method} ---\n<failed: {err}>\n"),
-        });
-    }
+    out.push_str(&match summary {
+        Ok(body) => section("retrieveUserQuotaSummary", body),
+        Err(err) => format!("--- retrieveUserQuotaSummary ---\n<failed: {err}>\n"),
+    });
+    out.push_str(&match post(access_token, "fetchAvailableModels", &json!({}), user_agent) {
+        Ok(body) => section("fetchAvailableModels", &body),
+        Err(err) => format!("--- fetchAvailableModels ---\n<failed: {err}>\n"),
+    });
     out
 }
 
@@ -643,30 +659,40 @@ fn wire_field<'a>(node: &'a Value, camel: &str) -> Option<&'a Value> {
     })
 }
 
-/// The summary's buckets → Readings, read from `groups[].buckets[]`. The
-/// top-level `buckets[]` is marked deprecated in the descriptor and is
-/// deliberately not read: the spec asks for the summary shape and nothing else.
-///
-/// **No row, no bar** in four cases, all of them v1's "an absent Capability is
-/// unknown, never zero": a bucket with no `resetTime` is a rolling window that
-/// has not started, and fabricating an anchor would corrupt the `max(resets_at)`
-/// epoch derivation; a bucket carrying `remainingAmount` instead of
-/// `remainingFraction` is a count with no denominator — a figure, not a bar;
-/// `disabled` is a pool that exists but is off for this account; and an
-/// unrecognised `bucketId` is not guessed into a pool it may not belong to.
-fn windows(body: &Value) -> Vec<WindowExport> {
-    let mut out: Vec<WindowExport> = body
+/// Dated buckets become historical Readings. Buckets with a known fraction and
+/// no reset are current state, so the card can show them without inventing an epoch.
+fn windows(body: &Value) -> Result<(Vec<WindowExport>, Vec<LimitStateWindow>), String> {
+    let mut buckets: Vec<_> = body
         .get("groups")
-        .and_then(|g| g.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|group| group.get("buckets").and_then(|b| b.as_array()))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("buckets").and_then(Value::as_array))
         .flatten()
         .filter_map(bucket_window)
         .collect();
-    out.sort_by(|a, b| a.window_minutes.cmp(&b.window_minutes).then(a.key.cmp(&b.key)));
-    out
+    buckets.sort_by(|a, b| (a.window_minutes, &a.key).cmp(&(b.window_minutes, &b.key)));
+
+    if buckets.is_empty() {
+        return Err("Google returned no usable Antigravity quota windows".to_string());
+    }
+
+    let mut dated = Vec::new();
+    let mut undated = Vec::new();
+    for bucket in buckets {
+        if let Some(resets_at) = bucket.resets_at {
+            dated.push(WindowExport {
+                key: bucket.key,
+                window_minutes: bucket.window_minutes,
+                used_pct: bucket.used_pct,
+                resets_at,
+                ..Default::default()
+            });
+        } else {
+            undated.push(bucket);
+        }
+    }
+    Ok((dated, undated))
 }
 
 /// A bucket that carries a remaining *count* (`remainingAmount`) and no
@@ -678,12 +704,14 @@ fn reports_an_amount(bucket: &Value) -> bool {
         && wire_field(bucket, "remainingAmount").is_some()
 }
 
-fn bucket_window(bucket: &Value) -> Option<WindowExport> {
+fn bucket_window(bucket: &Value) -> Option<LimitStateWindow> {
     let id = wire_field(bucket, "bucketId").and_then(|b| b.as_str())?;
-    let Some((_, key, minutes)) = BUCKETS.iter().find(|(known, _, _)| *known == id) else {
-        eprintln!("antigravity-limits: skipping unrecognised bucket {id}");
+    if id.len() > 128
+        || !id.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
         return None;
-    };
+    }
     if wire_field(bucket, "disabled").and_then(|d| d.as_bool()) == Some(true) {
         return None;
     }
@@ -698,21 +726,35 @@ fn bucket_window(bucket: &Value) -> Option<WindowExport> {
         }
         return None;
     };
-    let resets_at = wire_field(bucket, "resetTime")
-        .and_then(|r| r.as_str())
-        .and_then(rfc3339_to_epoch)?;
+    if !(0.0..=1.0).contains(&remaining) {
+        return None;
+    }
+    let resets_at = match wire_field(bucket, "resetTime") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(rfc3339_to_epoch(value.as_str()?)?),
+    };
 
-    Some(WindowExport {
-        key: key.to_string(),
-        window_minutes: Some(*minutes),
-        // The fraction is what is LEFT, so 1.0 is untouched. Rounded to the
-        // integer percentage the card displays and evidence moves in, so a
-        // sub-point wobble is not a second fill level.
+    // Preserve the full pool identity so a dedicated Gemini model's quota
+    // remains distinct from the shared Gemini quota. A new cadence can still
+    // report a balance without an assumed duration.
+    let (key, window_minutes) = if let Some(pool) = id.strip_suffix("-5h") {
+        (format!("{pool}:w300"), Some(300))
+    } else if let Some(pool) = id.strip_suffix("-weekly") {
+        (format!("{pool}:w10080"), Some(10_080))
+    } else {
+        let duration = match wire_field(bucket, "window").and_then(Value::as_str) {
+            Some("5h") => Some(300),
+            Some("weekly") => Some(10_080),
+            _ => None,
+        };
+        (duration.map_or_else(|| id.to_string(), |minutes| format!("{id}:w{minutes}")), duration)
+    };
+
+    Some(LimitStateWindow {
+        key,
+        window_minutes,
         used_pct: ((1.0 - remaining) * 100.0).round(),
         resets_at,
-        // Antigravity is not in the estimate map; its Readings stay
-        // display-only until a ticket proves what each pool meters.
-        ..Default::default()
     })
 }
 
@@ -726,6 +768,14 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_desktop_user_agent_carries_the_installed_hub_version() {
+        assert_eq!(hub_user_agent(Some(" 2.36.0\n")), "antigravity/hub/2.36.0");
+        for missing in [None, Some(""), Some("2.35.1\r\nInvalid"), Some("2.35")] {
+            assert_eq!(hub_user_agent(missing), "antigravity/hub/2.35.1");
+        }
+    }
 
     // The summary shape as the vendor's own descriptors define it: buckets under
     // `groups[]`, the balance as a *remaining* fraction, and `resetTime` an
@@ -748,7 +798,8 @@ mod tests {
 
     #[test]
     fn four_buckets_become_four_pool_keyed_windows() {
-        let found = windows(&serde_json::from_str(SUMMARY).unwrap());
+        let (found, undated) = windows(&serde_json::from_str(SUMMARY).unwrap()).unwrap();
+        assert!(undated.is_empty());
         assert_eq!(
             found
                 .iter()
@@ -775,24 +826,56 @@ mod tests {
                 "resetTime":"2026-08-12T15:14:00Z"}]}]}"#,
         )
         .unwrap();
-        assert_eq!(windows(&body)[0].used_pct, 0.0);
+        assert_eq!(windows(&body).unwrap().0[0].used_pct, 0.0);
     }
 
     #[test]
     fn a_bucket_this_card_cannot_draw_yields_no_bar() {
-        // Every one of these is "unknown", and none of them is zero: a window
-        // that has not started, a count with no denominator, a pool that is off,
-        // and an id nobody has seen.
         for bucket in [
-            r#"{"bucketId":"gemini-5h","remainingFraction":0.5}"#,
+            r#"{"bucketId":"gemini-5h","remainingFraction":1.1}"#,
+            r#"{"bucketId":"gemini-5h","remainingFraction":0.5,"resetTime":"invalid"}"#,
             r#"{"bucketId":"gemini-5h","remainingAmount":"420","resetTime":"2026-08-12T15:14:00Z"}"#,
             r#"{"bucketId":"gemini-5h","remainingFraction":0.5,"disabled":true,"resetTime":"2026-08-12T15:14:00Z"}"#,
-            r#"{"bucketId":"gemini-image-5h","remainingFraction":0.5,"resetTime":"2026-08-12T15:14:00Z"}"#,
+            r#"{"bucketId":"ambiguous:id","remainingFraction":0.5,"resetTime":"2026-08-12T15:14:00Z"}"#,
         ] {
             let body: Value =
                 serde_json::from_str(&format!(r#"{{"groups":[{{"buckets":[{bucket}]}}]}}"#)).unwrap();
-            assert!(windows(&body).is_empty(), "{bucket}");
+            assert!(windows(&body).is_err(), "{bucket}");
         }
+    }
+
+    #[test]
+    fn additional_pools_keep_their_own_balances_and_unknown_cadences() {
+        let summary = json!({"groups": [{"buckets": [
+            {"bucketId": "gemini-weekly", "remainingFraction": 0.83399284, "resetTime": "2026-11-30T15:14:00Z"},
+            {"bucketId": "gemini-argon-wtu-weekly", "remainingFraction": 0.45, "resetTime": "2026-11-30T15:14:00Z"},
+            {"bucketId": "gemini-image-5h", "remainingFraction": 0.5},
+            {"bucketId": "partner-preview", "window": "rolling", "remainingFraction": 0.2}
+        ]}]});
+        let (dated, undated) = windows(&summary).unwrap();
+        assert_eq!(dated.iter().map(|w| (w.key.as_str(), w.used_pct)).collect::<Vec<_>>(),
+            vec![("gemini-argon-wtu:w10080", 55.0), ("gemini:w10080", 17.0)]);
+        assert_eq!(undated.iter().map(|w| (w.key.as_str(), w.window_minutes)).collect::<Vec<_>>(),
+            vec![("partner-preview", None), ("gemini-image:w300", Some(300))]);
+    }
+
+    #[test]
+    fn buckets_without_reset_times_remain_visible_without_entering_history() {
+        let body = json!({"groups": [{"buckets": [
+            {"bucketId": "3p-weekly", "remainingFraction": 1.0},
+            {"bucketId": "3p-5h", "remainingFraction": 0.75},
+            {"bucketId": "gemini-5h", "remainingFraction": 0.5, "resetTime": "2026-08-12T15:14:00Z"}
+        ]}]});
+        let (dated, undated) = windows(&body).unwrap();
+        assert_eq!(dated.len(), 1);
+        assert_eq!(dated[0].key, "gemini:w300");
+        assert_eq!(
+            undated
+                .iter()
+                .map(|w| (w.key.as_str(), w.used_pct, w.resets_at))
+                .collect::<Vec<_>>(),
+            vec![("3p:w300", 25.0, None), ("3p:w10080", 0.0, None)]
+        );
     }
 
     #[test]
@@ -823,7 +906,7 @@ mod tests {
                 "resetTime":"2026-08-16T02:00:00Z"}]}"#,
         )
         .unwrap();
-        assert!(windows(&body).is_empty());
+        assert!(windows(&body).is_err());
     }
 
     #[test]
@@ -837,7 +920,7 @@ mod tests {
                 "reset_time":"2026-08-12T15:14:00Z"}]}]}"#,
         )
         .unwrap();
-        let found = windows(&body);
+        let (found, _) = windows(&body).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].key, "gemini:w300");
         assert_eq!(found[0].used_pct, 58.0);
@@ -863,7 +946,13 @@ mod tests {
 
         // A malformed envelope must NOT borrow the absence prefix — the app
         // classifies on it, and an unreadable document is a failure.
-        for broken in ["not-an-envelope", "go-keyring-base64:!!!!", "go-keyring-base64:e30="] {
+        let non_object_token = base64::engine::general_purpose::STANDARD.encode(br#"{"token":[]}"#);
+        for broken in [
+            "not-an-envelope",
+            "go-keyring-base64:!!!!",
+            "go-keyring-base64:e30=",
+            &format!("{ENVELOPE_PREFIX}{non_object_token}"),
+        ] {
             // `.err()` rather than `expect_err`: `Credential` carries no Debug,
             // so a token can never reach a panic message by accident.
             let err = parse_envelope(broken).err().expect("must not parse");
@@ -903,12 +992,26 @@ mod tests {
         assert!(err.starts_with(NOT_SIGNED_IN), "{err}");
     }
 
+    #[test]
+    fn only_an_invalid_grant_is_reported_as_a_sign_in_failure() {
+        assert!(refresh_failure(400, &json!({"error": "invalid_grant"})).starts_with(NOT_SIGNED_IN));
+        for (status, error) in [(401, "invalid_client"), (403, "access_denied"), (502, "unknown")] {
+            let detail = refresh_failure(status, &json!({
+                "error": error,
+                "error_description": "sensitive server detail",
+            }));
+            assert!(!detail.starts_with(NOT_SIGNED_IN));
+            assert!(!detail.contains("sensitive server detail"));
+        }
+        assert!(!refresh_failure(400, &Value::Null).starts_with(NOT_SIGNED_IN));
+    }
+
     // Fabricated stand-ins, built from the real prefix rather than written out
     // as literals — a hand-typed `GOCSPX-…` in this file would read as a leaked
     // secret to every scanner that ever looks at the repository, and would tie
     // the fixtures to a spelling the constant could change out from under.
     fn fake_secret(fill: char) -> String {
-        format!("{}{}", std::str::from_utf8(SECRET_PREFIX).unwrap(), fill.to_string().repeat(28))
+        format!("{}{}", std::str::from_utf8(SECRET_PREFIX).unwrap(), fill.to_string().repeat(SECRET_SUFFIX_LEN))
     }
 
     fn id() -> String {
@@ -926,6 +1029,23 @@ mod tests {
         let secret = fake_secret('a');
         let found = secret_in(&image(&format!("{}.apps.googleusercontent.com\0{secret}", id())));
         assert_eq!(found.as_ref(), Some(&secret));
+    }
+
+    #[test]
+    fn go_string_table_text_after_the_client_secret_is_excluded() {
+        let secret = fake_secret('a');
+        let found = secret_in(&image(&format!("{}\0{secret}extraName99", id())));
+        assert_eq!(found.as_ref(), Some(&secret));
+    }
+
+    #[test]
+    fn the_desktop_oauth_pair_wins_over_a_nearer_other_client() {
+        let (desktop, other) = (fake_secret('a'), fake_secret('b'));
+        let binary = image(&format!(
+            ":generateContent{desktop}example-sandbox.googleapis.com\0{other}\0{}",
+            id(),
+        ));
+        assert_eq!(secret_in(&binary).as_deref(), Some(desktop.as_str()));
     }
 
     #[test]

@@ -1311,10 +1311,8 @@ pub fn limits(
 
 /// Overlay each live Source's CURRENT Limit state onto the cards the Readings
 /// built (glossary: Usage Reset — "current state, not a Reading", and this is
-/// the same status). The Claude desktop app's history is the one producer of a
-/// state Artifact today; nothing here names it, so the next Source that can
-/// prove current state without proving history is a catalog entry and a
-/// writer.
+/// the same status). Claude desktop history and Antigravity's live quota
+/// companion publish state when they can report a percentage without its reset.
 ///
 /// Read outside the database snapshot, exactly as the Usage Reset count is: a
 /// file was never part of the transaction's view, and pretending otherwise
@@ -2862,9 +2860,8 @@ mod tests {
 
     /// One Source's current state, as the desktop channel writes it.
     // The overlay is Source-agnostic on purpose, exactly like the Usage Reset
-    // read beside it (only Codex writes that count; only the Claude desktop
-    // channel writes a state Artifact today), so these tests use the same
-    // fixture Source the neighbouring Usage Reset tests do. The Claude
+    // read beside it, so these tests can use the same fixture Source the
+    // neighbouring Usage Reset tests do. The Claude
     // production path — desktop history → Readings + state → this query — is
     // proven end to end in scan.rs's desktop-history test.
     fn state_of(
@@ -2888,6 +2885,32 @@ mod tests {
 
     fn state_window(key: &str, minutes: Option<i64>, used_pct: f64, resets_at: Option<i64>) -> LimitStateWindow {
         LimitStateWindow { key: key.to_string(), window_minutes: minutes, used_pct, resets_at }
+    }
+
+    #[test]
+    fn antigravity_live_state_is_visible_without_historical_readings() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_db(&dir.path().join("t.db")).unwrap();
+        let exports = dir.path().join("limit-exports");
+        crate::limits_artifact::write_state(
+            &exports,
+            &LimitState {
+                schema: STATE_SCHEMA,
+                source: "antigravity".to_string(),
+                via: "live".to_string(),
+                observed_at: EVALUATED_AT - 60,
+                windows: vec![state_window("3p:w300", Some(300), 25.0, None)],
+            },
+        )
+        .unwrap();
+
+        let cards = limits(&conn, EVALUATED_AT, &exports).unwrap();
+        let card = cards.iter().find(|card| card.source == "antigravity").unwrap();
+        let window = &card.windows[0];
+        assert_eq!(window.window_key, "3p:w300");
+        assert_eq!(window.used_pct, 25.0);
+        assert_eq!(window.resets_at, None);
+        assert_eq!(window.via, "live");
     }
 
     #[test]

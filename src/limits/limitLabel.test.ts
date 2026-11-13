@@ -26,4 +26,9 @@ describe('a window label as text', () => {
     // A pool nobody has named renders raw rather than disappearing.
     expect(text('zeta:w300')).toEqual({ text: 'zeta · Session' });
   });
+
+  it('names dedicated Antigravity pools without assuming unknown durations', () => {
+    expect(text('gemini-argon-wtu:w10080', 'antigravity')).toEqual({ text: 'Gemini 4 Argon · Weekly' });
+    expect(text('partner-preview', 'antigravity')).toEqual({ text: 'Partner preview' });
+  });
 });

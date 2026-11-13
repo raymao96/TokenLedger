@@ -18,6 +18,7 @@ import type { SourceLimits } from '../types';
 import { cards, durationParts, freshness, nextDueAt, planLabel, windowLabel, type CardView, type EstimateView, type Mode, type WindowView, resetLabel } from './limits.derive';
 import { tauriLimits, LIVE_ENABLED_KEY, MODE_KEY, type LimitsPort } from './limits';
 import { runDueLiveChecks, storedFailures, type LiveFailure } from './limits.live';
+import { poolPrefix } from './limitLabel';
 
 type T = ReturnType<typeof useT>['t'];
 
@@ -308,6 +309,7 @@ function Row({ w, source, mode, t }: { w: WindowView; source: string; mode: Mode
             {label.kind === 'weeklyCredits' && t('limits.win.weeklyCredits')}
             {label.kind === 'monthlyCredits' && t('limits.win.monthlyCredits')}
             {label.kind === 'other' && fill(t('limits.win.other'), { n: label.minutes })}
+            {label.kind === 'quota' && label.name}
             {label.kind === 'model' && (
               <>
                 {label.model}
@@ -493,19 +495,6 @@ function OptIn({ t, onEnable }: { t: T; onEnable: () => void }) {
       </button>
     </div>
   );
-}
-
-// A window key's pool, where it carries one. `3p` is named "Other models"
-// rather than "Claude" because what it really means is *non-Gemini* — the set
-// behind it changes, and a label naming today's members would rot. A pool
-// nobody has named renders raw, the way an unseen per-model window does.
-function poolPrefix(t: T, pool: string | undefined): string {
-  if (!pool) return '';
-  const named: Record<string, string> = {
-    gemini: t('limits.pool.gemini'),
-    '3p': t('limits.pool.other'),
-  };
-  return `${named[pool] ?? pool} · `;
 }
 
 // "1d 6h" — largest two units, in the reader's own language.
