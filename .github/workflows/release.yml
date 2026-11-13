@@ -17,8 +17,8 @@
 # emits nothing for the updater to serve. Targets that do not apply to the host
 # are skipped without error, so one list serves all three legs.
 #
-# One-time setup: `gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/tokenledger.key`
-# (the key has no password, so TAURI_SIGNING_PRIVATE_KEY_PASSWORD stays empty).
+# Configure repository secrets TAURI_PRIVATE_KEY and TAURI_KEY_PASSWORD
+# with the updater signing private key and its password.
 #
 # Cut a release once the PRs it ships have merged to main:
 #   1. Bump the version in one commit on main, "Bump the release version to
@@ -115,8 +115,8 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           tagName: ${{ github.ref_name }}

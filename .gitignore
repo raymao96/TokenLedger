@@ -38,3 +38,8 @@ src-tauri/binaries/
 # CSV reports written by the report::ledger_report workflow — real Ledger
 # figures, and never committed for the same reason source artifacts aren't.
 tokenledger-report-*/
+
+# Local agent collaboration files
+*.md
+worklogs/
+.opencode/
